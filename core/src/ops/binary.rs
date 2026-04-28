@@ -231,7 +231,21 @@ impl TypedOp for TypedBinOp {
             let input_facts = model.node_input_facts(node.id)?;
             let must_swap_inputs =
                 input_facts.iter().collect_tuple().is_some_and(|(a_fact, b_fact)| {
-                    (a_fact.shape.volume() - b_fact.shape.volume()).prove_strict_negative()
+                    let diff = a_fact.shape.volume() - b_fact.shape.volume();
+                    // Concrete fast path.
+                    if diff.prove_strict_negative() {
+                        return true;
+                    }
+                    // Symbolic case: lower-bound by setting every free
+                    // symbol to its minimum (1 — shape dims can never
+                    // be 0 in a live model). If the lower bound is
+                    // already strict-negative, we know swap is right
+                    // for any realised shape.
+                    let mut values = SymbolValues::default();
+                    for sym in diff.symbols() {
+                        values.set(&sym, 1);
+                    }
+                    diff.eval(&values).to_i64().is_ok_and(|v| v < 0)
                 });
             let (operand_1, operand_2) = if must_swap_inputs {
                 (input_facts[1], input_facts[0])
