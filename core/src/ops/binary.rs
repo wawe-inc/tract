@@ -432,7 +432,23 @@ fn find_most_efficient_config(
 }
 
 pub fn gt_tdim(x: TDim, min_val: i64) -> bool {
-    TDim::Val(min_val).mini(x).to_i64().is_ok_and(|v| v == min_val)
+    // Fast path: x is concrete, just compare.
+    if let Ok(v) = x.to_i64() {
+        return v > min_val;
+    }
+    // Symbolic: lower-bound by evaluating with every free symbol set
+    // to 1. If even that lower bound exceeds min_val (because of a
+    // concrete factor like the channel count in a typical conv), the
+    // SIMD path is safe to pick. This unlocks OptBinByScalar /
+    // OptBinUnicast for symbolic-shape models (e.g. ONNX exports with
+    // dynamic batch + length axes), where the previous behaviour
+    // always rejected them and fell back to scalar generic eval.
+    let mut values = SymbolValues::default();
+    for sym in x.symbols() {
+        values.set(&sym, 1);
+    }
+    let lower = x.eval(&values);
+    lower.to_i64().is_ok_and(|v| v > min_val)
 }
 
 #[derive(Clone)]
