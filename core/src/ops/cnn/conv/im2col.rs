@@ -62,6 +62,8 @@ impl ResolveTo<ConcreteGeometry> for SymbolicGeometry {
             Patcher::Padded2d
         } else if !pool.patch.padded && pool.patch.rank() == 1 {
             Patcher::Valid1d
+        } else if pool.patch.rank() == 1 {
+            Patcher::Padded1d
         } else {
             Patcher::Generic
         };
@@ -239,6 +241,7 @@ enum Patcher {
     Generic,
     Valid1d,
     Valid2d,
+    Padded1d,
     Padded2d,
 }
 
@@ -254,6 +257,13 @@ impl Patcher {
         match self {
             Patcher::Valid1d => Self::valid_1d::<T>(geo, input, pack, g),
             Patcher::Valid2d => Self::valid_2d::<T>(geo, input, pack, g),
+            Patcher::Padded1d => Self::padded_1d::<T>(
+                geo,
+                input,
+                pack,
+                g,
+                pad_value.unwrap_or(&Tensor::zero_scalar::<T>()?),
+            ),
             Patcher::Padded2d => Self::padded_2d::<T>(
                 geo,
                 input,
@@ -330,6 +340,67 @@ impl Patcher {
             }
             Ok(())
         }
+    }
+
+    #[inline(never)]
+    fn padded_1d<'p, T: Copy + Datum>(
+        geometry: &'p ConcreteGeometry,
+        input: &TensorView,
+        pack: &'p mut TensorView,
+        g: usize,
+        pad_value: &Tensor,
+    ) -> TractResult<()> {
+        // Mirror of padded_2d for 1D padded conv (rank() == 1, padded).
+        // Without this, 1D padded convs fall back to Patcher::Generic
+        // which materialises a full im2col output buffer with scalar
+        // bounds-checked writes — measured ~75% of forward-pass cost
+        // on a depth-10 dilated TCN. Splitting per-kernel-position into
+        // pad / valid / pad runs lets the inner loops vectorise.
+        unsafe {
+            let pad_value = *pad_value.to_scalar_unchecked();
+            let pack = pack.as_slice_mut_unchecked::<T>();
+            let x_stride = geometry.pool.patch.spec.strides[0] as isize;
+            let shape = &geometry.input_shape_with_n;
+            // For NCHW with rank() == 1, the single spatial dim is in
+            // the "h" slot. h_stride() is the spatial stride.
+            let x_stride_ptr = x_stride * *shape.h_stride() as isize;
+            let c_stride_ptr = *shape.c_stride() as isize;
+            let input_width = shape.hw_dims()[0] as isize;
+            let kernel_len = geometry.pool.patch.standard_layout_data_field.len();
+            let mut writer =
+                geometry.b_pack.write_with_k_outer(pack.as_mut_ptr(), geometry.k, geometry.n);
+            let iptr = input.as_ptr_unchecked::<T>();
+            let iptr = iptr.add(g * geometry.ci_per_group * shape.c_stride());
+            let output_width = *geometry.pool.patch.output_shape.get_unchecked(0);
+            for ci in 0..geometry.ci_per_group {
+                let iptr = iptr.offset(ci as isize * c_stride_ptr);
+                for kitem in 0..kernel_len {
+                    // For rank() == 1, data_field is shape (kernel_len, 1).
+                    let dx = *geometry.pool.patch.data_field.as_ptr().offset(kitem as isize);
+                    let valid_x_start =
+                        Integer::div_ceil(&-dx, &x_stride).max(0).min(output_width as _);
+                    let valid_x_end =
+                        Integer::div_ceil(&(input_width - dx), &x_stride).min(output_width as _);
+                    let iptr = iptr.offset(
+                        *geometry.pool.patch.standard_layout_data_field.get_unchecked(kitem),
+                    );
+                    Self::padded_2d_invalid_x_loop(valid_x_start as usize, pad_value, &mut writer);
+                    Self::padded_2d_valid_x_loop(
+                        valid_x_start,
+                        valid_x_end,
+                        x_stride_ptr,
+                        iptr,
+                        &mut writer,
+                    );
+                    Self::padded_2d_invalid_x_loop(
+                        output_width - valid_x_end as usize,
+                        pad_value,
+                        &mut writer,
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[inline(never)]
