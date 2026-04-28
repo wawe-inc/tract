@@ -379,8 +379,16 @@ impl Patcher {
                     let dx = *geometry.pool.patch.data_field.as_ptr().offset(kitem as isize);
                     let valid_x_start =
                         Integer::div_ceil(&-dx, &x_stride).max(0).min(output_width as _);
-                    let valid_x_end =
-                        Integer::div_ceil(&(input_width - dx), &x_stride).min(output_width as _);
+                    // Clamp valid_x_end >= valid_x_start. Without this,
+                    // when |dx| exceeds input_width (high-dilation 1D
+                    // conv on short sequences — e.g. dilation 1024 on
+                    // L=24), valid_x_end goes negative and the later
+                    // `output_width - valid_x_end as usize` underflows
+                    // via signed→unsigned wrap, producing a huge invalid
+                    // pad-fill count and out-of-bounds writes.
+                    let valid_x_end = Integer::div_ceil(&(input_width - dx), &x_stride)
+                        .max(valid_x_start)
+                        .min(output_width as _);
                     let iptr = iptr.offset(
                         *geometry.pool.patch.standard_layout_data_field.get_unchecked(kitem),
                     );
